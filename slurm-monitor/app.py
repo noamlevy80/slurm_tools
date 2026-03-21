@@ -350,7 +350,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="SLURM GPU Monitor")
-    parser.add_argument("--port", type=int, default=5000, help="Port to listen on")
+    parser.add_argument("--port", type=int, default=8765, help="Port to listen on")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--interval", type=float, default=1.0, help="Refresh interval in seconds")
     args = parser.parse_args()
