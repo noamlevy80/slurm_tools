@@ -22,19 +22,21 @@ A live web dashboard that shows all running SLURM jobs and their GPU utilization
 - Jobs must have GPUs allocated for nvidia-smi stats to appear
 
 ### Usage
+When connecting to the login node, make sure to forward the port, so you can connect to the app in a browser on your PC:
+ssh -L 8765:127.0.0.1:8765 pcl-tiergarten-login.sc.intel.com
 
 ```bash
 cd slurm-monitor
 python3 app.py
 ```
 
-Then open `http://<hostname>:5000` in a browser.
+Then open `http://127.0.0.1:8765` in a browser.
 
 #### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--port` | `5000` | Port to listen on |
+| `--port` | `8765` | Port to listen on |
 | `--host` | `0.0.0.0` | Host/IP to bind to |
 | `--interval` | `1.0` | Data refresh interval in seconds |
 
