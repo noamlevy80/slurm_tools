@@ -23,8 +23,11 @@ A live web dashboard that shows all running SLURM jobs and their GPU utilization
 
 ### Usage
 When connecting to the login node, make sure to forward the port, so you can connect to the app in a browser on your PC:
+```bash
 ssh -L 8765:127.0.0.1:8765 pcl-tiergarten-login.sc.intel.com
+```
 
+And then to open the app
 ```bash
 cd slurm-monitor
 python3 app.py
