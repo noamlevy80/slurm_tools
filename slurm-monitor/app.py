@@ -2,10 +2,11 @@
 """SLURM Job Monitor — live GPU stats dashboard."""
 
 import json
+import os
 import subprocess
 import threading
 import time
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 # ── Configuration ────────────────────────────────────────────────────────────
 REFRESH_INTERVAL = 1  # seconds between data refreshes (configurable)
@@ -16,6 +17,7 @@ app = Flask(__name__)
 lock = threading.Lock()
 jobs = []  # latest squeue snapshot
 gpu_history: dict[str, list[dict]] = {}  # jobid -> [{ts, mem_used, mem_total, util}, ...]
+stdout_paths: dict[str, str] = {}  # jobid -> stdout file path (cached)
 MAX_HISTORY = 300  # keep ~5 min at 1 s interval
 
 
@@ -79,6 +81,35 @@ def fetch_gpu_stats(jobid: str) -> list[dict] | None:
         return None
 
 
+def fetch_stdout_path(jobid: str) -> str | None:
+    """Get the StdOut file path for a job via scontrol."""
+    try:
+        result = subprocess.run(
+            ["scontrol", "show", "job", jobid],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in result.stdout.splitlines():
+            for part in line.split():
+                if part.startswith("StdOut="):
+                    return part.split("=", 1)[1]
+    except Exception:
+        pass
+    return None
+
+
+def read_log_tail(path: str, max_bytes: int = 64 * 1024) -> str:
+    """Read the tail of a log file."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "r", errors="replace") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+                f.readline()  # skip partial line
+            return f.read()
+    except Exception:
+        return ""
+
+
 def background_loop():
     """Continuously refresh job list and GPU stats."""
     global jobs
@@ -130,6 +161,20 @@ def api_gpu(jobid):
         return jsonify(history)
 
 
+@app.route("/api/log/<jobid>")
+def api_log(jobid):
+    # Get cached path or fetch it
+    path = stdout_paths.get(jobid)
+    if not path:
+        path = fetch_stdout_path(jobid)
+        if path:
+            stdout_paths[jobid] = path
+    if not path or not os.path.isfile(path):
+        return jsonify({"path": None, "content": ""})
+    content = read_log_tail(path)
+    return jsonify({"path": path, "content": content})
+
+
 @app.route("/api/config")
 def api_config():
     return jsonify({"refresh_interval": REFRESH_INTERVAL})
@@ -168,8 +213,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .job-row .state.PENDING { color: var(--pending); }
   .job-row .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-  /* ── Right panel ── */
-  .detail { flex: 1; padding: 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 20px; }
+  /* ── Middle panel (graphs) ── */
+  .detail { flex: 2; padding: 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 20px; }
   .detail.empty { align-items: center; justify-content: center; }
   .detail.empty p { color: var(--text2); font-size: 1.1rem; }
   .chart-box { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; flex: 1; min-height: 250px; display: flex; flex-direction: column; }
@@ -178,6 +223,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .job-meta { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px; display: flex; gap: 24px; flex-wrap: wrap; font-size: .85rem; }
   .job-meta span { color: var(--text2); }
   .job-meta b { color: var(--text); margin-left: 4px; }
+
+  /* ── Right panel (log output) ── */
+  .log-panel { width: 33.3%; min-width: 300px; border-left: 1px solid var(--border); display: flex; flex-direction: column; background: var(--surface); }
+  .log-header { padding: 10px 16px; border-bottom: 1px solid var(--border); font-size: .75rem; color: var(--text2); text-transform: uppercase; letter-spacing: .05em; display: flex; align-items: center; gap: 8px; }
+  .log-header .log-path { color: var(--accent2); text-transform: none; letter-spacing: normal; font-size: .78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .log-content { flex: 1; overflow-y: auto; padding: 12px 16px; font-family: 'Fira Code', 'Cascadia Code', 'Consolas', monospace; font-size: .75rem; line-height: 1.5; white-space: pre-wrap; word-break: break-all; color: #c8c8c8; background: #0a0c10; }
+  .log-empty { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text2); font-size: .9rem; }
 
   /* scrollbar */
   ::-webkit-scrollbar { width: 6px; }
@@ -200,6 +252,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="detail empty" id="detail">
     <p>← Select a job to see GPU stats</p>
   </div>
+  <div class="log-panel" id="logPanel">
+    <div class="log-header">
+      <span>Job Output</span>
+      <span class="log-path" id="logPath"></span>
+    </div>
+    <div class="log-empty" id="logEmpty">Select a job to view its output</div>
+    <div class="log-content" id="logContent" style="display:none;"></div>
+  </div>
 </div>
 
 <script>
@@ -219,7 +279,7 @@ async function fetchJobs() {
     const data = await r.json();
     renderJobs(data);
     document.getElementById('status').textContent = `${data.length} jobs · refreshing every ${refreshInterval/1000}s`;
-    if (selectedJob) fetchGpu(selectedJob);
+    if (selectedJob) { fetchGpu(selectedJob); fetchLog(selectedJob); }
   } catch(e) {
     document.getElementById('status').textContent = 'connection lost';
   }
@@ -246,6 +306,7 @@ function selectJob(jobid) {
   // Highlight
   document.querySelectorAll('.job-row').forEach(r => r.classList.toggle('selected', r.querySelector('div').textContent === jobid));
   fetchGpu(jobid);
+  fetchLog(jobid);
 }
 
 async function fetchGpu(jobid) {
@@ -334,6 +395,29 @@ function updateCharts(history, nGpus) {
   }
   memChart.update('none');
   utilChart.update('none');
+}
+
+async function fetchLog(jobid) {
+  const logContent = document.getElementById('logContent');
+  const logEmpty = document.getElementById('logEmpty');
+  const logPath = document.getElementById('logPath');
+  try {
+    const r = await fetch(`/api/log/${jobid}`);
+    const data = await r.json();
+    if (!data.path) {
+      logContent.style.display = 'none';
+      logEmpty.style.display = 'flex';
+      logEmpty.textContent = 'No output file found for this job';
+      logPath.textContent = '';
+      return;
+    }
+    logPath.textContent = data.path;
+    logContent.textContent = data.content || '(empty)';
+    logContent.style.display = 'block';
+    logEmpty.style.display = 'none';
+    // Auto-scroll to bottom
+    logContent.scrollTop = logContent.scrollHeight;
+  } catch(e) { /* ignore transient errors */ }
 }
 </script>
 </body>
