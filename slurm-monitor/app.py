@@ -267,6 +267,8 @@ const COLORS = ['#6c63ff','#00c9a7','#f59e0b','#ef4444','#3b82f6','#ec4899','#14
 let selectedJob = null;
 let memChart = null, utilChart = null;
 let refreshInterval = 1000;
+let pollCount = 0;
+const LOG_EVERY_N = 20;
 
 // Fetch config
 fetch('/api/config').then(r=>r.json()).then(c => { refreshInterval = c.refresh_interval * 1000; startPolling(); });
@@ -279,7 +281,11 @@ async function fetchJobs() {
     const data = await r.json();
     renderJobs(data);
     document.getElementById('status').textContent = `${data.length} jobs · refreshing every ${refreshInterval/1000}s`;
-    if (selectedJob) { fetchGpu(selectedJob); fetchLog(selectedJob); }
+    if (selectedJob) {
+      fetchGpu(selectedJob);
+      if (pollCount % LOG_EVERY_N === 0) fetchLog(selectedJob);
+      pollCount++;
+    }
   } catch(e) {
     document.getElementById('status').textContent = 'connection lost';
   }
@@ -303,6 +309,7 @@ function renderJobs(data) {
 
 function selectJob(jobid) {
   selectedJob = jobid;
+  pollCount = 0;  // reset so log fetches immediately on selection
   // Highlight
   document.querySelectorAll('.job-row').forEach(r => r.classList.toggle('selected', r.querySelector('div').textContent === jobid));
   fetchGpu(jobid);
