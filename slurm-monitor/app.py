@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """SLURM Job Monitor — live GPU stats dashboard."""
 
+import atexit
 import json
 import os
+import signal
 import subprocess
+import sys
 import threading
 import time
 from flask import Flask, jsonify, render_template_string, request
@@ -18,6 +21,7 @@ lock = threading.Lock()
 jobs = []  # latest squeue snapshot
 gpu_history: dict[str, list[dict]] = {}  # jobid -> [{ts, mem_used, mem_total, util}, ...]
 stdout_paths: dict[str, str] = {}  # jobid -> stdout file path (cached)
+completed_jobs: dict[str, dict] = {}  # jobid -> job dict for jobs that left the queue
 MAX_HISTORY = 300  # keep ~5 min at 1 s interval
 
 
@@ -115,6 +119,7 @@ def background_loop():
     global jobs
     while True:
         new_jobs = fetch_jobs()
+        queue_ids = {j["jobid"] for j in new_jobs}
         running_ids = {j["jobid"] for j in new_jobs if j["state"] == "RUNNING"}
 
         # Collect GPU stats for all running jobs (in parallel via threads)
@@ -131,11 +136,26 @@ def background_loop():
 
         ts = time.time()
         with lock:
-            jobs = new_jobs
-            # Prune history for jobs that no longer exist
-            stale = set(gpu_history.keys()) - running_ids
+            # Detect jobs that were previously tracked but left the queue
+            prev_ids = {j["jobid"] for j in jobs}
+            disappeared = prev_ids - queue_ids
+            for jid in disappeared:
+                # Mark as completed if it was in our previous list and not already tracked
+                if jid not in completed_jobs:
+                    prev_job = next((j for j in jobs if j["jobid"] == jid), None)
+                    if prev_job:
+                        completed_jobs[jid] = {**prev_job, "state": "COMPLETED"}
+
+            # Merge: queue jobs + completed jobs
+            jobs = new_jobs + [j for j in completed_jobs.values() if j["jobid"] not in queue_ids]
+
+            # Do NOT prune gpu_history for completed jobs — keep their data
+            # Only prune jobs that are neither running nor completed
+            tracked_ids = running_ids | set(completed_jobs.keys())
+            stale = set(gpu_history.keys()) - tracked_ids
             for jid in stale:
                 del gpu_history[jid]
+
             # Append new data points
             for jid, stats in gpu_results.items():
                 if stats is None:
@@ -175,6 +195,17 @@ def api_log(jobid):
     return jsonify({"path": path, "content": content})
 
 
+@app.route("/api/remove/<jobid>", methods=["DELETE"])
+def api_remove(jobid):
+    with lock:
+        if jobid in completed_jobs:
+            del completed_jobs[jobid]
+            gpu_history.pop(jobid, None)
+            stdout_paths.pop(jobid, None)
+            return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "Job not completed or not found"}), 400
+
+
 @app.route("/api/config")
 def api_config():
     return jsonify({"refresh_interval": REFRESH_INTERVAL})
@@ -211,6 +242,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .job-row .state { font-weight: 600; }
   .job-row .state.RUNNING { color: var(--running); }
   .job-row .state.PENDING { color: var(--pending); }
+  .job-row .state.COMPLETED { color: var(--text2); }
   .job-row .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   /* ── Middle panel (graphs) ── */
@@ -273,12 +305,16 @@ const LOG_EVERY_N = 20;
 // Fetch config
 fetch('/api/config').then(r=>r.json()).then(c => { refreshInterval = c.refresh_interval * 1000; startPolling(); });
 
-function startPolling() { fetchJobs(); setInterval(fetchJobs, refreshInterval); }
+let pollTimer = null;
+let connectionLost = false;
+
+function startPolling() { fetchJobs(); pollTimer = setInterval(fetchJobs, refreshInterval); }
 
 async function fetchJobs() {
   try {
     const r = await fetch('/api/jobs');
     const data = await r.json();
+    connectionLost = false;
     renderJobs(data);
     document.getElementById('status').textContent = `${data.length} jobs · refreshing every ${refreshInterval/1000}s`;
     if (selectedJob) {
@@ -287,7 +323,11 @@ async function fetchJobs() {
       pollCount++;
     }
   } catch(e) {
-    document.getElementById('status').textContent = 'connection lost';
+    if (!connectionLost) {
+      connectionLost = true;
+      document.getElementById('status').textContent = 'server stopped — polling paused';
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    }
   }
 }
 
@@ -426,6 +466,26 @@ async function fetchLog(jobid) {
     logContent.scrollTop = logContent.scrollHeight;
   } catch(e) { /* ignore transient errors */ }
 }
+
+// Delete key removes completed jobs
+document.addEventListener('keydown', async (e) => {
+  if (e.key === 'Delete' && selectedJob) {
+    try {
+      const r = await fetch(`/api/remove/${selectedJob}`, { method: 'DELETE' });
+      const data = await r.json();
+      if (data.ok) {
+        selectedJob = null;
+        document.getElementById('detail').className = 'detail empty';
+        document.getElementById('detail').innerHTML = '<p>\u2190 Select a job to see GPU stats</p>';
+        document.getElementById('logContent').style.display = 'none';
+        document.getElementById('logEmpty').style.display = 'flex';
+        document.getElementById('logEmpty').textContent = 'Select a job to view its output';
+        document.getElementById('logPath').textContent = '';
+        fetchJobs();
+      }
+    } catch(e) { /* ignore */ }
+  }
+});
 </script>
 </body>
 </html>"""
@@ -437,6 +497,16 @@ def index():
 
 
 # ── Start ────────────────────────────────────────────────────────────────────
+# ── Clean shutdown ───────────────────────────────────────────────────────────
+def _shutdown(signum=None, frame=None):
+    """Ensure the process exits cleanly when the terminal is closed."""
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, _shutdown)
+signal.signal(signal.SIGHUP, _shutdown)
+atexit.register(lambda: None)  # ensure atexit hooks run
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -450,6 +520,11 @@ if __name__ == "__main__":
 
     t = threading.Thread(target=background_loop, daemon=True)
     t.start()
-    print(f"🖥️  SLURM GPU Monitor starting on http://{args.host}:{args.port}")
+    print(f"\U0001f5a5\ufe0f  SLURM GPU Monitor starting on http://{args.host}:{args.port}")
     print(f"   Refresh interval: {REFRESH_INTERVAL}s")
-    app.run(host=args.host, port=args.port, debug=False)
+    try:
+        app.run(host=args.host, port=args.port, debug=False)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.exit(0)
